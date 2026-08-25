@@ -78,6 +78,17 @@ void sendSensorFrame(const uint8_t payload[SENSOR_PAYLOAD_LEN])
     }
     Serial2.write(checksum);
     Serial2.write(FRAME_TAIL);
+
+    Serial.write(FRAME_HEADER0);
+    Serial.write(FRAME_HEADER1);
+    Serial.write(UART_MSG_SENSOR_DATA);
+    Serial.write(SENSOR_PAYLOAD_LEN);
+    for (int i = 0; i < SENSOR_PAYLOAD_LEN; i++)
+    {
+        Serial.write(payload[i]);
+    }
+    Serial.write(checksum);
+    Serial.write(FRAME_TAIL);
 }
 
 // ==================== 传感器状态更新 ====================
