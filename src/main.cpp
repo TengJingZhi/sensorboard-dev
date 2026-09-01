@@ -47,7 +47,9 @@ const int SendMsgPin = 42;
 #define FRAME_HEADER1 0x55
 #define FRAME_TAIL 0x0D
 #define UART_MSG_SENSOR_DATA 0x01
-#define UART_MSG_START 0x02 // 主板下发的流程开始指令
+#define UART_MSG_START 0x02       // 主板→从板：请求开始（三次握手第1步）
+#define UART_MSG_START_ACK 0x04   // 从板→主板：确认就绪（三次握手第2步）
+#define UART_MSG_START_CONFIRM 0x05 // 主板→从板：最终确认（三次握手第3步）
 #define SENSOR_PAYLOAD_LEN (VIBERATION_COUNT + LASER_COUNT) // 7 + 4 = 11
 
 // ==================== 从板状态 ====================
@@ -65,9 +67,19 @@ unsigned long vibrationBlockUntil = 0;
 uint8_t lastSentPayload[SENSOR_PAYLOAD_LEN] = {0};
 unsigned long lastSendTime = 0;
 
-// 流程开始标志：收到主板 START 指令后才开始正式上报
+// 流程开始标志：收到主板 START_CONFIRM 指令后才开始正式上报
 bool flowStarted = false;
 unsigned long matchStartedAt = 0;
+
+// 三次握手状态机
+typedef enum
+{
+    HS_IDLE = 0,    // 等待主板 START_REQ (0x02)
+    HS_ACK_SENT,    // 已回复 ACK (0x04)，等待 START_CONFIRM (0x05)
+    HS_DONE         // 握手完成，比赛中
+} HandshakeState;
+
+HandshakeState handshakeState = HS_IDLE;
 
 // ==================== 显示状态 ====================
 // 用于“变化触发 + 周期刷新”的显示快照
@@ -131,6 +143,42 @@ void sendSensorFrame(const uint8_t payload[SENSOR_PAYLOAD_LEN])
     Serial.printf("%02X\n", FRAME_TAIL);
 }
 
+// ==================== 控制帧发送（0-payload 握手帧） ====================
+void sendControlFrame(uint8_t msgType)
+{
+    uint8_t checksum = msgType ^ 0; // payload 长度为 0
+
+    Serial2.write(FRAME_HEADER0);
+    Serial2.write(FRAME_HEADER1);
+    Serial2.write(msgType);
+    Serial2.write(0); // payload len = 0
+    Serial2.write(checksum);
+    Serial2.write(FRAME_TAIL);
+
+    // 调试串口可视化
+    Serial.print("[TX] ");
+    Serial.printf("%02X ", FRAME_HEADER0);
+    Serial.printf("%02X ", FRAME_HEADER1);
+    Serial.printf("%02X ", msgType);
+    Serial.printf("%02X ", 0);
+    Serial.printf("%02X ", checksum);
+    Serial.printf("%02X\n", FRAME_TAIL);
+}
+
+// ==================== 比赛状态重置（用于比赛重开） ====================
+void resetMatchState()
+{
+    flowStarted = false;
+    handshakeState = HS_IDLE;
+    memset(laserAcc, 0, sizeof(laserAcc));
+    memset(laserState, 0, sizeof(laserState));
+    vibrationActive = -1;
+    vibrationBlockUntil = 0;
+    memset(lastSentPayload, 0, sizeof(lastSentPayload));
+    displayDirty = true;
+    Serial.println("[SLAVE] 比赛状态已重置");
+}
+
 // ==================== 接收函数 ====================
 static void resetRxState()
 {
@@ -143,10 +191,34 @@ static void handleRxFrame(uint8_t msgType, const uint8_t *payload, uint8_t len)
 {
     if (msgType == UART_MSG_START && len == 0)
     {
-        flowStarted = true;
-        matchStartedAt = millis();
+        // 三次握手第1步：收到主板 START_REQ (0x02)
+        // 若比赛已在进行（重开场景），先重置状态
+        if (handshakeState == HS_DONE)
+        {
+            resetMatchState();
+        }
+        // 回复 ACK (0x04)
+        sendControlFrame(UART_MSG_START_ACK);
+        handshakeState = HS_ACK_SENT;
         displayDirty = true;
-        Serial.println("[SLAVE] 收到主板 START 指令，开始正式流程");
+        Serial.println("[SLAVE] 收到 START_REQ (0x02)，已回复 ACK (0x04)，等待 CONFIRM");
+    }
+    else if (msgType == UART_MSG_START_CONFIRM && len == 0)
+    {
+        // 三次握手第3步：收到主板 START_CONFIRM (0x05)
+        if (handshakeState != HS_DONE)
+        {
+            flowStarted = true;
+            matchStartedAt = millis();
+            handshakeState = HS_DONE;
+            displayDirty = true;
+            Serial.println("[SLAVE] 收到 START_CONFIRM (0x05)，比赛开始！");
+        }
+        else
+        {
+            // 已在比赛中，忽略重复帧
+            Serial.println("[SLAVE] 收到重复 START_CONFIRM，已忽略");
+        }
     }
     else
     {
